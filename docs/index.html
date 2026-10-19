@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PharmaLens · Pharma research copilot</title>
+<meta name="description" content="Agentic RAG copilot for pharma literature: grounded answers from clinical studies, claim checks against recent research, and live web context.">
+<meta property="og:title" content="PharmaLens · Pharma research copilot">
+<meta property="og:description" content="Ask the evidence. Check if it still holds. Built with LangGraph, Qdrant and Groq.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,500;1,9..144,500&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper: #FAF8F3; --ink: #1C1B1A; --muted: #5F5E5A; --faint: #B4B2A9;
+    --line: #D3D1C7; --green: #0F6E56; --green-soft: #E1F5EE; --amber: #BA7517;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; background: var(--paper); color: var(--ink);
+         font-family: Inter, system-ui, sans-serif; display: flex; align-items: center;
+         justify-content: center; padding: 24px 16px; }
+  main { width: 100%; max-width: 460px; text-align: center; }
+  .brand { font-family: Fraunces, serif; font-size: 40px; font-weight: 500; letter-spacing: -0.8px; }
+  .brand em { color: var(--green); }
+  .tag { color: var(--muted); margin: 6px 0 32px; font-size: 15px; }
+
+  .ring { position: relative; width: 168px; height: 168px; margin: 0 auto 24px; }
+  .ring svg { transform: rotate(-90deg); }
+  .ring circle { fill: none; stroke-width: 8; }
+  .track { stroke: var(--line); }
+  .bar { stroke: var(--green); stroke-linecap: round; transition: stroke-dashoffset 1s linear; }
+  .ring .num { position: absolute; inset: 0; display: flex; flex-direction: column;
+               align-items: center; justify-content: center; }
+  .num b { font-family: Fraunces, serif; font-size: 44px; font-weight: 500; line-height: 1; }
+  .num span { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .pulse { position: absolute; inset: 18px; border-radius: 50%; background: var(--green-soft);
+           animation: pulse 2.4s ease-in-out infinite; z-index: -1; }
+  @keyframes pulse { 0%,100% { transform: scale(.85); opacity: .5 } 50% { transform: scale(1); opacity: 1 } }
+
+  h1 { font-size: 18px; font-weight: 500; margin: 0 0 6px; }
+  .step { color: var(--muted); font-size: 14px; min-height: 22px; transition: opacity .3s; }
+  .dots::after { content: ""; animation: dots 1.4s steps(4) infinite; }
+  @keyframes dots { 0% { content: "" } 25% { content: "." } 50% { content: ".." } 75% { content: "..." } }
+
+  .btn { display: inline-block; margin-top: 20px; padding: 10px 18px; border-radius: 8px;
+         background: var(--ink); color: var(--paper); text-decoration: none; font-size: 14px; }
+  .btn.ghost { background: transparent; color: var(--ink); border: 1px solid var(--faint); }
+  .hidden { display: none; }
+  .note { margin-top: 28px; font-size: 12px; color: var(--muted); line-height: 1.6; }
+  .note b { color: var(--ink); font-weight: 500; }
+  .ready .bar { stroke: var(--green); }
+  .ready .pulse { animation: none; opacity: 1; }
+  .error .bar { stroke: var(--amber); }
+  @media (prefers-reduced-motion: reduce) { .pulse, .dots::after { animation: none; } }
+</style>
+</head>
+<body>
+<main id="app">
+  <div class="brand">Pharma<em>Lens</em></div>
+  <div class="tag">Ask the evidence. Check if it still holds.</div>
+
+  <div class="ring" aria-hidden="true">
+    <div class="pulse"></div>
+    <svg width="168" height="168" viewBox="0 0 168 168">
+      <circle class="track" cx="84" cy="84" r="74"/>
+      <circle class="bar" id="bar" cx="84" cy="84" r="74"/>
+    </svg>
+    <div class="num"><b id="count">60</b><span id="unit">seconds</span></div>
+  </div>
+
+  <h1 id="title">Checking the server<span class="dots"></span></h1>
+  <div class="step" id="step" role="status" aria-live="polite">This takes a second.</div>
+
+  <a class="btn hidden" id="open" href="#">Open PharmaLens</a>
+
+  <div class="note">
+    This free demo sleeps when nobody is using it. The first visit wakes it up in about a minute.<br>
+    Built by <b>Shivam Singh</b> · LangGraph · Qdrant · Groq · Gemini
+  </div>
+</main>
+
+<script>
+  // ── Configure: your Hugging Face Space ("username/space-name") ──────────────
+  const SPACE_ID = "YOUR_HF_USERNAME/pharmalens";
+  const WAIT_SECONDS = 60;
+  // ────────────────────────────────────────────────────────────────────────────
+
+  const [owner, name] = SPACE_ID.split("/");
+  const fallbackDomain = `${owner}-${name}`.toLowerCase().replace(/[^a-z0-9-]/g, "-") + ".hf.space";
+  let appUrl = `https://${fallbackDomain}`;
+
+  const $ = (id) => document.getElementById(id);
+  const bar = $("bar");
+  const CIRC = 2 * Math.PI * 74;
+  bar.style.strokeDasharray = CIRC;
+  bar.style.strokeDashoffset = 0;
+
+  const STEPS = [
+    "Waking the server",
+    "Starting the container",
+    "Loading the LangGraph pipeline",
+    "Connecting to the Qdrant vector store",
+    "Warming up the Groq LLM",
+    "Almost there",
+  ];
+
+  let remaining = WAIT_SECONDS, timer = null, poller = null, woke = false, done = false;
+
+  function setStep(text) {
+    const el = $("step");
+    el.style.opacity = 0;
+    setTimeout(() => { el.textContent = text; el.style.opacity = 1; }, 250);
+  }
+
+  function goToApp() {
+    if (done) return;
+    done = true;
+    clearInterval(timer); clearInterval(poller);
+    document.body.classList.add("ready");
+    bar.style.strokeDashoffset = 0;
+    $("count").textContent = "✓"; $("unit").textContent = "ready";
+    $("title").textContent = "Opening PharmaLens";
+    setStep("Redirecting you now.");
+    $("open").href = appUrl; $("open").classList.remove("hidden");
+    setTimeout(() => { window.location.replace(appUrl); }, 700);
+  }
+
+  function wake() {
+    if (woke) return;
+    woke = true;
+    // Any request to the Space wakes it. A hidden iframe is the most reliable trigger.
+    const f = document.createElement("iframe");
+    f.src = appUrl; f.style.display = "none"; f.setAttribute("aria-hidden", "true");
+    document.body.appendChild(f);
+    fetch(appUrl, { mode: "no-cors" }).catch(() => {});
+  }
+
+  function startCountdown() {
+    $("title").innerHTML = 'Starting the demo<span class="dots"></span>';
+    setStep(STEPS[0]);
+    timer = setInterval(() => {
+      remaining = Math.max(remaining - 1, 0);
+      $("count").textContent = remaining;
+      bar.style.strokeDashoffset = CIRC * (1 - remaining / WAIT_SECONDS);
+      const i = Math.min(Math.floor((WAIT_SECONDS - remaining) / (WAIT_SECONDS / STEPS.length)), STEPS.length - 1);
+      if ($("step").textContent !== STEPS[i]) setStep(STEPS[i]);
+      if (remaining === 0) {
+        clearInterval(timer);
+        $("count").textContent = "…"; $("unit").textContent = "any moment";
+        $("title").innerHTML = 'Taking a little longer<span class="dots"></span>';
+        setStep("Still starting. You can also try opening it directly.");
+        $("open").href = appUrl; $("open").classList.add("ghost"); $("open").classList.remove("hidden");
+      }
+    }, 1000);
+  }
+
+  async function checkStage() {
+    try {
+      const res = await fetch(`https://huggingface.co/api/spaces/${SPACE_ID}/runtime`, { cache: "no-store" });
+      if (!res.ok) throw new Error(res.status);
+      const rt = await res.json();
+      const domain = rt.domains && rt.domains[0] && rt.domains[0].domain;
+      if (domain) appUrl = `https://${domain}`;
+      return rt.stage;
+    } catch (e) {
+      return "UNKNOWN";
+    }
+  }
+
+  function showError(msg) {
+    clearInterval(timer); clearInterval(poller);
+    document.body.classList.add("error");
+    $("count").textContent = "!"; $("unit").textContent = "";
+    $("title").textContent = "The demo is offline right now";
+    setStep(msg);
+    $("open").href = `https://huggingface.co/spaces/${SPACE_ID}`;
+    $("open").textContent = "View on Hugging Face";
+    $("open").classList.remove("hidden");
+  }
+
+  async function tick() {
+    const stage = await checkStage();
+    if (stage === "RUNNING") return goToApp();
+    if (stage === "PAUSED" || stage === "STOPPED") return showError("It's paused for maintenance. Please check back later.");
+    if (stage === "BUILD_ERROR" || stage === "RUNTIME_ERROR" || stage === "CONFIG_ERROR")
+      return showError("Something went wrong on the server. Please check back later.");
+    // SLEEPING, BUILDING, APP_STARTING, RUNNING_BUILDING or UNKNOWN: wake it and wait.
+    wake();
+    if (!timer && remaining === WAIT_SECONDS) startCountdown();
+  }
+
+  tick();
+  poller = setInterval(tick, 4000);
+</script>
+</body>
+</html>
