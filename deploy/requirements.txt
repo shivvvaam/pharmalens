@@ -1,4 +1,4 @@
-# Runtime dependencies for the Streamlit app only (used by the Dockerfile).
+# Runtime dependencies for the Streamlit app only (Streamlit Cloud and the Dockerfile).
 # Evaluation / dev tools (deepeval, pytest, chromadb, ...) live in requirements.txt.
 streamlit==1.57.0
 python-dotenv==1.2.2

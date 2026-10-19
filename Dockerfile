@@ -12,9 +12,9 @@ ENV HOME=/home/user \
 
 WORKDIR /app
 
-# ── Layer 1: runtime deps only (cached until requirements-app.txt changes) ────
-COPY --chown=user requirements-app.txt .
-RUN pip install --no-cache-dir --user -r requirements-app.txt
+# ── Layer 1: runtime deps only (cached until deploy/requirements.txt changes) ────
+COPY --chown=user deploy/requirements.txt requirements.txt
+RUN pip install --no-cache-dir --user -r requirements.txt
 
 # ── Layer 2: app code and theme ──────────────────────────────────────────────
 COPY --chown=user backend/ backend/

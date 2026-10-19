@@ -1,19 +1,7 @@
----
-title: PharmaLens
-emoji: 🔬
-colorFrom: green
-colorTo: gray
-sdk: docker
-app_port: 7860
-pinned: false
-short_description: Agentic RAG copilot for pharma literature
----
-
 # PharmaLens — Pharma Research Copilot
 
 A conversational AI assistant for pharma students and researchers to upload, explore, and verify clinical studies and drug papers through natural language chat.
 
-> The YAML block above is Hugging Face Spaces config. See [Deploying for free](#deploying-for-free-hugging-face-spaces--github-pages).
 
 ---
 
@@ -217,36 +205,35 @@ uv run python evaluate.py
 
 ---
 
-## Deploying for free (Hugging Face Spaces + GitHub Pages)
+## Deploying for free (Streamlit Community Cloud)
 
-The app runs on a free **Hugging Face Docker Space**. A small **GitHub Pages** landing page (`docs/index.html`) is the public link: it never sleeps, wakes the Space if it's asleep, shows a 60-second countdown, and redirects to the app once it's running.
+### 1. Deploy
+1. Push this repo to GitHub (public).
+2. Go to [share.streamlit.io](https://share.streamlit.io), sign in with GitHub, and click **Create app → Deploy a public app from GitHub**.
+3. Repository `<your-github-username>/pharmalens`, branch `main`, main file path **`deploy/streamlit_app.py`**, and pick a custom subdomain such as `pharmalens`.
+4. Under **Advanced settings**, choose Python 3.12 and paste the secrets:
 
-### 1. Create the Space
-1. Sign up at [huggingface.co](https://huggingface.co) → **New Space** → name `pharmalens`, SDK **Docker**, hardware **CPU basic (free)**, visibility **Public**.
-2. In the Space → **Settings → Variables and secrets**, add these as **Secrets**:
-   `GROQ_API_KEY`, `GOOGLE_API_KEY`, `QDRANT_URL`, `QDRANT_API_KEY`, `TAVILY_API_KEY`
-3. Optional **Variables**: `PAPEER_MAX_QUESTIONS` (default 15) and `PAPEER_MAX_UPLOADS` (default 3) per visitor.
-
-### 2. Push the code to the Space
-Create an access token with **write** permission (HF → Settings → Access Tokens), then:
-
-```bash
-git remote add space https://huggingface.co/spaces/<your-hf-username>/pharmalens
-git push space main
+```toml
+GROQ_API_KEY = "..."
+GOOGLE_API_KEY = "..."
+QDRANT_URL = "..."
+QDRANT_API_KEY = "..."
+TAVILY_API_KEY = "..."
+PAPEER_PUBLIC = "1"
 ```
 
-Use your HF username and the token as the password when prompted. Hugging Face rejects plain-git binary files, so track the PDF and PNG with LFS before the first push (`git lfs install`, then `git lfs track "*.pdf" "*.png"`, then `git lfs migrate import --include="*.pdf,*.png" --everything`). The Space builds the `Dockerfile` (port 7860, `PAPEER_PUBLIC=1`) and goes live at `https://<your-hf-username>-pharmalens.hf.space`.
+`deploy/streamlit_app.py` runs `app.py`; it lives in `deploy/` so Community Cloud installs the slim `deploy/requirements.txt` instead of the root `uv.lock` (which also includes the evaluation stack).
 
-### 3. Publish the landing page
-1. In `docs/index.html`, set `SPACE_ID` to `"<your-hf-username>/pharmalens"`.
-2. Push to your GitHub repo → **Settings → Pages** → Source: **Deploy from a branch**, branch `main`, folder `/docs`.
-3. Share `https://<your-github-username>.github.io/<repo-name>/` — this is the link for LinkedIn.
+### 2. Keep it awake
+Community Cloud sleeps apps after 12 hours without visitors. `.github/workflows/keep-alive.yml` visits the app every 6 hours and clicks the wake-up button if needed. Enable it by adding a repository variable: **Settings → Secrets and variables → Actions → Variables → `APP_URL`** = `https://<your-subdomain>.streamlit.app`. GitHub pauses scheduled workflows after 60 days without repository activity, so push a commit occasionally.
 
 ### Public demo mode
-With `PAPEER_PUBLIC=1` (set in the Dockerfile):
+With `PAPEER_PUBLIC=1`:
 - Every browser gets its own private sessions (ID kept in the URL as `?v=...`), so visitors never see each other's chats or papers.
-- Questions and uploads per visitor are capped, and uploads are limited to 10 MB, to protect free-tier API quotas.
-- Use free-tier API keys with no billing attached. Data on a free Space resets on restart; Qdrant collections persist in Qdrant Cloud.
+- Per visitor: 15 questions, 3 papers and 10 MB per file by default (`PAPEER_MAX_QUESTIONS`, `PAPEER_MAX_UPLOADS`, `PAPEER_MAX_FILE_MB`).
+- Use free-tier API keys with no billing attached. Local files (sessions, checkpoints) reset when the app restarts; Qdrant collections persist in Qdrant Cloud.
+
+The `Dockerfile` (port 7860, public mode on) still works for any Docker host.
 
 ---
 

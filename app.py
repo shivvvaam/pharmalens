@@ -28,6 +28,7 @@ STACK = "LangGraph · Qdrant · Groq · Gemini"
 PUBLIC_MODE = os.getenv("PAPEER_PUBLIC", "").lower() in ("1", "true", "yes")
 MAX_QUESTIONS = int(os.getenv("PAPEER_MAX_QUESTIONS", "15"))
 MAX_UPLOADS = int(os.getenv("PAPEER_MAX_UPLOADS", "3"))
+MAX_FILE_MB = int(os.getenv("PAPEER_MAX_FILE_MB", "10"))
 
 # ── Styles ─────────────────────────────────────────────────────────────────────
 st.markdown(
@@ -555,6 +556,9 @@ with st.sidebar:
                         if limit_reached("uploads"):
                             st.warning(LIMIT_MSG["uploads"])
                             break
+                        if PUBLIC_MODE and f.size > MAX_FILE_MB * 1024 * 1024:
+                            st.warning(f"{f.name} is over the {MAX_FILE_MB} MB demo limit.")
+                            continue
                         if f.name in st.session_state[processed_key]:
                             st.info(f"Already loaded: {f.name}")
                             continue

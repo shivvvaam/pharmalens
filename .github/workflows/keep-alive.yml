@@ -1,0 +1,49 @@
+# Streamlit Community Cloud puts apps to sleep after 12 hours without visitors.
+# This visits the app every 6 hours (and clicks the wake-up button if it ever
+# appears), so LinkedIn visitors never land on a sleeping app.
+#
+# Setup: repo Settings -> Secrets and variables -> Actions -> Variables ->
+#        New variable APP_URL = https://<your-app>.streamlit.app
+name: Keep app awake
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: ${{ vars.APP_URL != '' }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Playwright
+        run: |
+          pip install playwright==1.48.0
+          python -m playwright install --with-deps chromium
+      - name: Visit the app
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          python - <<'EOF'
+          import os
+          from playwright.sync_api import sync_playwright
+
+          url = os.environ["APP_URL"]
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              page = browser.new_page()
+              page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+              page.wait_for_timeout(10_000)
+              wake = page.get_by_role("button", name="Yes, get this app back up!")
+              if wake.count():
+                  print("App was asleep, waking it up")
+                  wake.click()
+                  page.wait_for_timeout(60_000)
+              else:
+                  print("App is awake")
+              browser.close()
+          EOF
