@@ -1,5 +1,8 @@
+import argparse
 import asyncio
 import json
+import os
+import random
 import sys
 import threading
 import time
@@ -8,6 +11,23 @@ from uuid import uuid4
 
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
+
+# Retrieval settings under comparison. Each run evaluates one variant against the same
+# cached pharma goldens, so scores are directly comparable (see eval/compare.py).
+VARIANTS = {
+    "baseline":     {},  # app defaults: 1000/200 chunks, plain top-k similarity
+    "small_chunks": {"PAPEER_CHUNK_SIZE": "500", "PAPEER_CHUNK_OVERLAP": "100"},
+    "score_filter": {"PAPEER_MIN_SCORE": "0.65"},
+    "combined":     {"PAPEER_CHUNK_SIZE": "500", "PAPEER_CHUNK_OVERLAP": "100", "PAPEER_MIN_SCORE": "0.65"},
+}
+
+parser = argparse.ArgumentParser(description="Evaluate PharmaLens retrieval on pharma papers.")
+parser.add_argument("--variant", choices=VARIANTS, default="baseline")
+parser.add_argument("--full", action="store_true", help="run all 5 metrics on every case (~100+ judge calls)")
+parser.add_argument("--cases", type=int, default=6, help="cases judged in quick mode")
+ARGS = parser.parse_args()
+# Backend modules read these at import time, so they must be set before the imports below.
+os.environ.update(VARIANTS[ARGS.variant])
 
 import groq
 from dotenv import load_dotenv
@@ -27,24 +47,30 @@ from deepeval.synthesizer import Synthesizer
 from deepeval.synthesizer.config import ContextConstructionConfig
 from deepeval.test_case import LLMTestCase
 
-from backend.paper_loader import load_document
+from backend.paper_loader import load_arxiv
 from backend.rag_graph import build_graph
 from backend.vector_store import add_paper, embeddings, get_collection_name, qdrant_client
 
 load_dotenv()
 
-PDF_PATH            = "documents/Openclaw_Research_Report.pdf"
-GOLDENS_FILE        = Path("goldens.json")
-MAX_CONTEXTS        = 5
+# Open-access arXiv papers spanning clinical trials, drug discovery and drug molecules.
+PAPERS = {
+    "2307.15051": "Matching Patients to Clinical Trials with Large Language Models (TrialGPT)",
+    "2304.05376": "ChemCrow: Augmenting large-language models with chemistry tools",
+    "2309.03907": "DrugChat: Towards Enabling ChatGPT-Like Capabilities on Drug Molecule Graphs",
+}
+EVAL_DIR            = Path("eval")
+GOLDENS_FILE        = EVAL_DIR / "goldens_pharma.json"
+CONTEXTS_PER_PAPER  = 2
+CHUNKS_PER_CONTEXT  = 3
 GOLDENS_PER_CONTEXT = 2
 METRIC_THRESHOLD    = 0.7
 JUDGE_MODEL         = "gemini-2.5-flash"
 RATE_LIMIT_RETRIES  = 5
 RATE_LIMIT_WAIT_S   = 30  # Groq's on-demand TPM window is per minute
-ANSWERS_FILE        = Path("eval_answers.json")
+ANSWERS_FILE        = EVAL_DIR / f"answers_{ARGS.variant}.json"
+RESULTS_FILE        = EVAL_DIR / f"results_{ARGS.variant}.json"
 JUDGE_MIN_INTERVAL_S = 13  # Gemini free tier: 5 requests/min per model
-QUICK_EVAL          = True  # False runs all 5 metrics on every case (~100+ judge calls)
-QUICK_EVAL_CASES    = 5
 
 
 class ThrottledGeminiModel(GeminiModel):
@@ -96,23 +122,39 @@ class GeminiEmbedder(DeepEvalBaseEmbeddingModel):
         return self.name
 
 
-def generate_goldens(judge: GeminiModel) -> list[dict]:
+def load_papers() -> dict[str, list]:
+    return {arxiv_id: load_arxiv(arxiv_id) for arxiv_id in PAPERS}
+
+
+def build_contexts(chunks: list, rng: random.Random) -> list[list[str]]:
+    """Pick windows of consecutive chunks from each paper's body, skipping the title/author
+    block at the start and the references at the end, which make poor questions."""
+    body = chunks[2 : int(len(chunks) * 0.8)]
+    starts = range(0, max(len(body) - CHUNKS_PER_CONTEXT, 0) + 1, CHUNKS_PER_CONTEXT)
+    picked = sorted(rng.sample(list(starts), min(CONTEXTS_PER_PAPER, len(starts))))
+    return [[c.page_content for c in body[i : i + CHUNKS_PER_CONTEXT]] for i in picked]
+
+
+def generate_goldens(judge: GeminiModel, papers: dict[str, list]) -> list[dict]:
     synthesizer = Synthesizer(model=judge)
-    goldens = synthesizer.generate_goldens_from_docs(
-        document_paths=[PDF_PATH],
-        include_expected_output=True,
-        max_goldens_per_context=GOLDENS_PER_CONTEXT,
-        context_construction_config=ContextConstructionConfig(
-            max_contexts_per_document=MAX_CONTEXTS,
-            embedder=GeminiEmbedder(),
-            critic_model=judge,
-        ),
-    )
-    pairs = [
-        {"input": g.input, "expected_output": g.expected_output}
-        for g in goldens
-        if g.input and g.expected_output
-    ]
+    rng = random.Random(42)
+    per_paper = []
+    for arxiv_id, chunks in papers.items():
+        goldens = synthesizer.generate_goldens_from_contexts(
+            contexts=build_contexts(chunks, rng),
+            include_expected_output=True,
+            max_goldens_per_context=GOLDENS_PER_CONTEXT,
+        )
+        per_paper.append([
+            {"source": arxiv_id, "input": g.input, "expected_output": g.expected_output}
+            for g in goldens
+            if g.input and g.expected_output
+        ])
+    # Interleave papers so a quick run's first N cases cover every paper.
+    shortest = min(map(len, per_paper))
+    pairs = [p for group in zip(*per_paper) for p in group]
+    pairs += [p for group in per_paper for p in group[shortest:]]
+    EVAL_DIR.mkdir(exist_ok=True)
     GOLDENS_FILE.write_text(json.dumps(pairs, indent=2, ensure_ascii=False), encoding="utf-8")
     return pairs
 
@@ -139,19 +181,19 @@ def run_rag_query(graph, query: str, session_id: str, thread_id: str) -> tuple[s
     return answer, retrieval_context
 
 
-def generate_answers(pairs: list[dict]) -> list[dict]:
-    docs = load_document(PDF_PATH)
+def generate_answers(pairs: list[dict], papers: dict[str, list]) -> list[dict]:
     graph = build_graph(db_path="eval_checkpoints.db")
 
-    # Ingest the paper once into a single throwaway collection; each query gets its
+    # Ingest the papers once into a single throwaway collection; each query gets its
     # own checkpoint thread so conversation history doesn't leak between goldens.
     session_id = f"evaluation_session_{uuid4()}"
-    add_paper(docs, session_id)
+    for chunks in papers.values():
+        add_paper(chunks, session_id)
 
     answers = []
     try:
         for pair in pairs:
-            query = pair["input"] + " as per the report in knowledge base"
+            query = pair["input"] + " as per the papers in the knowledge base"
             for attempt in range(1, RATE_LIMIT_RETRIES + 1):
                 try:
                     # Fresh thread per attempt so a half-finished run doesn't leave history behind.
@@ -177,25 +219,29 @@ def generate_answers(pairs: list[dict]) -> list[dict]:
 
 
 def main() -> None:
+    print(f"Variant: {ARGS.variant} {VARIANTS[ARGS.variant] or '(app defaults)'}")
     judge = ThrottledGeminiModel(model=JUDGE_MODEL)
-    pairs = load_goldens() if GOLDENS_FILE.exists() else generate_goldens(judge)
 
     # Answers are cached so a failed judging run doesn't re-spend the Groq quota.
-    # Delete eval_answers.json to re-run the RAG pipeline after changing it.
+    # Delete the variant's answers file to re-run the RAG pipeline after changing it.
     if ANSWERS_FILE.exists():
         answers = json.loads(ANSWERS_FILE.read_text(encoding="utf-8"))
         print(f"Loaded {len(answers)} cached answers from {ANSWERS_FILE}")
     else:
-        answers = generate_answers(pairs)
+        # Papers are chunked with this variant's settings; goldens are generated once and
+        # shared by every variant so all runs answer the same questions.
+        papers = load_papers()
+        pairs = load_goldens() if GOLDENS_FILE.exists() else generate_goldens(judge, papers)
+        answers = generate_answers(pairs, papers)
 
-    if QUICK_EVAL:
-        # Fits Gemini's free tier (20 requests/day): one retrieval metric, one generation
-        # metric, no reason strings (each reason is an extra judge call). ~4 calls/case.
+    if not ARGS.full:
+        # Fits Gemini's free tier: Contextual Relevancy (the weakest metric on the earlier
+        # run) plus Faithfulness, without reason strings (each reason is an extra judge call).
         metrics = [
-            ContextualRecallMetric(threshold=METRIC_THRESHOLD, model=judge, include_reason=False),
+            ContextualRelevancyMetric(threshold=METRIC_THRESHOLD, model=judge, include_reason=False),
             FaithfulnessMetric(threshold=METRIC_THRESHOLD, model=judge, include_reason=False),
         ]
-        answers = answers[:QUICK_EVAL_CASES]
+        answers = answers[:ARGS.cases]
     else:
         metrics = [
             ContextualPrecisionMetric(threshold=METRIC_THRESHOLD, model=judge),
@@ -231,9 +277,8 @@ def main() -> None:
             ],
         })
 
-    results_path = Path("eval_results.json")
-    results_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"\nResults saved to {results_path}.")
+    RESULTS_FILE.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"\nResults saved to {RESULTS_FILE}. Compare variants with: uv run python eval/compare.py")
 
 
 if __name__ == "__main__":

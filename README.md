@@ -2,12 +2,15 @@
 
 A conversational AI assistant for pharma students and researchers to upload, explore, and verify clinical studies and drug papers through natural language chat.
 
+**Live demo:** https://pharmalens-ai.streamlit.app/
+
+**Stack:** Python · LangGraph · LangChain · Qdrant · Groq (gpt-oss-120b) · Gemini embeddings · Tavily · Streamlit · DeepEval
 
 ---
 
 ## Project Description
 
-Papeer is a Retrieval-Augmented Generation (RAG) application built with LangGraph, LangChain, and Streamlit. Users upload research papers (PDF, TXT, Markdown, web URL, or ArXiv ID) into isolated sessions, then ask questions about them. The system routes each query intelligently — answering directly from paper content, searching the web for current developments, or verifying whether a claim from a paper has been superseded by newer research.
+PharmaLens is a Retrieval-Augmented Generation (RAG) application built with LangGraph, LangChain, and Streamlit. Users upload research papers (PDF, TXT, Markdown, web URL, or ArXiv ID) into isolated sessions, then ask questions about them. The system routes each query intelligently — answering directly from paper content, searching the web for current developments, or verifying whether a claim from a paper has been superseded by newer research.
 
 ---
 
@@ -66,12 +69,12 @@ Prefix any message with `/btw` to ask a question outside the current paper conte
 
 ## Installation
 
-Papeer uses [uv](https://github.com/astral-sh/uv) for dependency management.
+PharmaLens uses [uv](https://github.com/astral-sh/uv) for dependency management.
 
 ```bash
 # Clone the repository
-git clone <repo-url>
-cd rag-papeer-project
+git clone https://github.com/shivvvaam/pharmalens.git
+cd pharmalens
 
 # Install all dependencies
 uv sync
@@ -132,6 +135,8 @@ app.py (Streamlit UI)
 
 ### RAG Graph Decision Flow
 
+![PharmaLens LangGraph workflow](graph.png)
+
 ```
 User Query
     │
@@ -160,7 +165,7 @@ User Query
 | **Streaming responses** | `graph.stream()` is used with message mode so responses appear token-by-token rather than waiting for the full generation |
 | **Session persistence** | `sessions.json` persists session metadata; SQLite stores full conversation state — app restarts restore the previous session seamlessly |
 | **Temp file cleanup** | Uploaded files are written to a temp path, processed, then deleted regardless of success or failure |
-| **Async evaluation** | The evaluation pipeline uses throttled concurrency (3 workers, 5 s throttle) to stay within API rate limits |
+| **Rate-limited evaluation** | The evaluation pipeline judges cases sequentially with a 13 s spacing between judge calls (Gemini free tier) and retries Groq rate-limit errors, caching answers so a failed judging run doesn't re-spend the Groq quota |
 | **ArXiv reliability** | Claim verification uses two targeted Tavily searches (general web + `site:arxiv.org`) instead of the `arxiv` Python library, which had reliability issues |
 
 ---
@@ -181,7 +186,13 @@ User Query
 
 ## Evaluation
 
-Papeer includes an automated RAG evaluation pipeline (`evaluate.py`) built on [DeepEval](https://github.com/confident-ai/deepeval).
+PharmaLens includes an automated RAG evaluation pipeline (`evaluate.py`) built on [DeepEval](https://github.com/confident-ai/deepeval), run against open-access pharma papers:
+
+| arXiv ID | Paper | Domain |
+|---|---|---|
+| [2307.15051](https://arxiv.org/abs/2307.15051) | Matching Patients to Clinical Trials with Large Language Models (TrialGPT) | Clinical trials |
+| [2304.05376](https://arxiv.org/abs/2304.05376) | ChemCrow: Augmenting large-language models with chemistry tools | Drug discovery |
+| [2309.03907](https://arxiv.org/abs/2309.03907) | DrugChat: Towards Enabling ChatGPT-Like Capabilities on Drug Molecule Graphs | Drug molecules |
 
 ### Metrics (threshold: 0.7)
 
@@ -196,16 +207,39 @@ Papeer includes an automated RAG evaluation pipeline (`evaluate.py`) built on [D
 ### Running Evaluation
 
 ```bash
-uv run python evaluate.py
+uv run python evaluate.py --variant baseline       # run first: generates the shared goldens
+uv run python evaluate.py --variant small_chunks
+uv run python evaluate.py --variant score_filter
+uv run python evaluate.py --variant combined
+uv run python eval/compare.py                      # Markdown before/after table
 ```
 
-- On first run, synthetic golden test cases are generated from `documents/Openclaw_Research_Report.pdf` and cached to `goldens.json`
-- Results are written to `eval_results.json` with per-test metric scores, pass/fail status, and failure reasons
-- Subsequent runs reuse cached goldens unless `goldens.json` is deleted
+- On the first run, synthetic golden test cases are generated from passages of the three papers (title block and references skipped) and cached to `eval/goldens_pharma.json`. Every variant reuses the same goldens, so scores are directly comparable
+- Each variant writes `eval/answers_<variant>.json` (cached RAG answers) and `eval/results_<variant>.json` (per-test scores and pass/fail)
+- Quick mode (default) judges the first 6 cases on Contextual Relevancy and Faithfulness to fit Gemini's free tier; `--full` runs all five metrics on every case
+
+### Retrieval variants
+
+| Variant | Settings | Hypothesis |
+|---|---|---|
+| `baseline` | 1000/200 chunks, plain top-k similarity (app defaults) | Reference point |
+| `small_chunks` | 500/100 chunks | Smaller chunks carry less off-topic text per retrieved passage |
+| `score_filter` | Drop chunks with cosine similarity < 0.65 (best match always kept) | Fewer weakly related passages reach the answer step |
+| `combined` | Both of the above | |
+
+The same settings can be applied to the app with the `PAPEER_CHUNK_SIZE`, `PAPEER_CHUNK_OVERLAP` and `PAPEER_MIN_SCORE` environment variables.
+
+### Results
+
+<!-- TODO: paste the output of `uv run python eval/compare.py` here -->
+
+An earlier run on a single non-pharma report (kept in `eval/archive_openclaw/`) scored Faithfulness 0.98, Answer Relevancy 0.99 and Contextual Relevancy 0.58 across 10 cases. Contextual Relevancy, the weakest metric, is what the variants above target.
 
 ---
 
 ## Deploying for free (Streamlit Community Cloud)
+
+Other setup guides live in [`docs/`](docs/): [Qdrant Cloud setup](docs/qdrant_setup.md), [Docker deployment](docs/DOCKER_GUIDE.md), [Docker on AWS Ubuntu](docs/docker_install_on_AWS.md).
 
 ### 1. Deploy
 1. Push this repo to GitHub (public).

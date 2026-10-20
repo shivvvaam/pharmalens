@@ -1,3 +1,4 @@
+import os
 import re
 import tempfile
 import urllib.parse
@@ -10,8 +11,9 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 _ARXIV_ID_RE = re.compile(r"(\d{4}\.\d{4,5}(?:v\d+)?)")
 
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
+# Overridable so evaluate.py can compare chunking strategies without code changes.
+CHUNK_SIZE = int(os.getenv("PAPEER_CHUNK_SIZE", "1000"))
+CHUNK_OVERLAP = int(os.getenv("PAPEER_CHUNK_OVERLAP", "200"))
 
 _splitter = RecursiveCharacterTextSplitter(
     chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP, add_start_index=True

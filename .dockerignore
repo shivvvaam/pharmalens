@@ -11,7 +11,7 @@ embedding_cache/
 .claude/
 tests/
 graph_diag.ipynb
-eval_results.json
+eval/
 report.md
 CLAUDE.md
 .git/

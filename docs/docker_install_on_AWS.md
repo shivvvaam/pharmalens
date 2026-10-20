@@ -1,3 +1,6 @@
+# Installing Docker Engine on an AWS Ubuntu instance
+
+```bash
 ### update the packages
 sudo apt update
 sudo apt install ca-certificates curl
@@ -28,3 +31,4 @@ sudo docker run hello-world
 ### change username
 sudo groupadd docker
 sudo usermod -aG docker $USER
+```
