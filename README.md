@@ -2,7 +2,7 @@
 
 A conversational AI assistant for pharma students and researchers to upload, explore, and verify clinical studies and drug papers through natural language chat.
 
-**Live demo:** https://YOUR-SUBDOMAIN.streamlit.app <!-- TODO: replace with the deployed app URL -->
+**Live demo:** https://pharmalens-ai.streamlit.app/
 
 **Stack:** Python · LangGraph · LangChain · Qdrant · Groq (gpt-oss-120b) · Gemini embeddings · Tavily · Streamlit · DeepEval
 
