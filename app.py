@@ -2,9 +2,11 @@ import html
 import json
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +17,7 @@ from langchain_groq import ChatGroq
 
 from backend.btw_handler import handle_btw
 from backend.paper_loader import load_arxiv, load_document, load_webpage
-from backend.rag_graph import build_graph
+from backend.rag_graph import LLM_TIMEOUT_S, build_graph, log
 from backend.vector_store import add_paper, list_papers
 
 st.set_page_config(page_title="PharmaLens · Pharma research copilot", page_icon="🔬", layout="centered")
@@ -108,7 +110,7 @@ def get_graph():
 
 
 SESSIONS_FILE = Path("sessions.json")
-_rename_llm = ChatGroq(model="openai/gpt-oss-20b")
+_rename_llm = ChatGroq(model="openai/gpt-oss-20b", timeout=LLM_TIMEOUT_S, max_retries=2)
 _store_lock = threading.Lock()
 _VISITOR_RE = re.compile(r"^[0-9a-f-]{8,40}$")
 
@@ -469,6 +471,39 @@ def render_answer_body(msg: dict, key: str) -> None:
 
 
 graph = get_graph()
+
+
+STALL_DUMP_S = int(os.getenv("PAPEER_STALL_DUMP_S", "90"))
+
+
+def _stream_graph(input_state: dict, config: dict, status, placeholder, steps: list[dict]) -> str:
+    """Run the graph, updating the live trace and streaming the answer; returns the answer text."""
+    response_text = ""
+    # "updates" gives one event per finished node (for the live trace);
+    # "messages" gives LLM tokens (for streaming the final answer).
+    for mode, payload in graph.stream(input_state, config, stream_mode=["updates", "messages"]):
+        if mode == "updates":
+            for node, update in payload.items():
+                if not update:
+                    continue
+                for step in describe_update(node, update):
+                    steps.append(step)
+                    status.markdown(f"**{step['title']}** — {step['detail']}")
+                    status.update(label=f"{step['title']} · working…", expanded=True)
+        else:
+            chunk, metadata = payload
+            if (
+                metadata.get("langgraph_node") == "generate_answer"
+                and hasattr(chunk, "content")
+                and chunk.content
+            ):
+                if not response_text:
+                    status.update(label="Writing answer…", expanded=True)
+                response_text += chunk.content
+                placeholder.markdown(fmt_math(response_text) + "▌")
+    return response_text
+
+
 VISITOR_ID = get_visitor_id()
 
 # ── Bootstrap ──────────────────────────────────────────────────────────────────
@@ -786,32 +821,40 @@ if prompt:
             badge_slot = st.empty()
             status = st.status("Routing your question…", expanded=True)
             placeholder = st.empty()
-            response_text = ""
             steps: list[dict] = []
             started = time.perf_counter()
 
-            # "updates" gives one event per finished node (for the live trace);
-            # "messages" gives LLM tokens (for streaming the final answer).
-            for mode, payload in graph.stream(input_state, config, stream_mode=["updates", "messages"]):
-                if mode == "updates":
-                    for node, update in payload.items():
-                        if not update:
-                            continue
-                        for step in describe_update(node, update):
-                            steps.append(step)
-                            status.markdown(f"**{step['title']}** — {step['detail']}")
-                            status.update(label=f"{step['title']} · working…", expanded=True)
-                else:
-                    chunk, metadata = payload
-                    if (
-                        metadata.get("langgraph_node") == "generate_answer"
-                        and hasattr(chunk, "content")
-                        and chunk.content
-                    ):
-                        if not response_text:
-                            status.update(label="Writing answer…", expanded=True)
-                        response_text += chunk.content
-                        placeholder.markdown(fmt_math(response_text) + "▌")
+            # If a run is still going after STALL_DUMP_S, dump every thread's stack to the
+            # app logs so a hang shows exactly where it is blocked.
+            run_thread = threading.current_thread()
+
+            def _dump_stalled_run():
+                log.warning("graph run session=%s still running after %ss; thread stacks follow", active_sid[:8], STALL_DUMP_S)
+                frames = sys._current_frames()
+                for t in threading.enumerate():
+                    frame = frames.get(t.ident)
+                    if frame is not None:
+                        mark = " (this run)" if t is run_thread else ""
+                        log.warning("--- %s%s ---\n%s", t.name, mark, "".join(traceback.format_stack(frame)))
+
+            watchdog = threading.Timer(STALL_DUMP_S, _dump_stalled_run)
+            watchdog.daemon = True
+            watchdog.start()
+            log.info("graph run start session=%s first=%s", active_sid[:8], is_first_message)
+            try:
+                response_text = _stream_graph(input_state, config, status, placeholder, steps)
+                run_error = None
+            except Exception as exc:  # surface the failure instead of spinning forever
+                log.exception("graph run failed session=%s", active_sid[:8])
+                run_error = exc
+            finally:
+                watchdog.cancel()
+            log.info("graph run end session=%s in %.1fs", active_sid[:8], time.perf_counter() - started)
+
+            if run_error is not None:
+                status.update(label="Pipeline failed", state="error", expanded=True)
+                placeholder.error(f"Something went wrong while answering ({type(run_error).__name__}). Please try again.")
+                st.stop()
 
             elapsed = time.perf_counter() - started
             visible = [s for s in steps if not s.get("hidden")]

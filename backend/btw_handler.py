@@ -3,14 +3,12 @@ from typing import Generator
 
 from dotenv import load_dotenv
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_groq import ChatGroq
 from tavily import TavilyClient
 
 from backend.models import BtwRouteDecision
+from backend.rag_graph import TAVILY_TIMEOUT_S, llm, structured_llm
 
 load_dotenv()
-
-llm = ChatGroq(model="openai/gpt-oss-120b")
 
 
 def handle_btw(query: str) -> Generator[str, None, None]:
@@ -21,11 +19,11 @@ def handle_btw(query: str) -> Generator[str, None, None]:
          "current prices, breaking news) or if your general knowledge is sufficient."),
         ("human", "{query}"),
     ])
-    decision = (route_prompt | llm.with_structured_output(BtwRouteDecision)).invoke({"query": query})
+    decision = (route_prompt | structured_llm(BtwRouteDecision)).invoke({"query": query})
 
     if decision.needs_web_search:
         client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
-        results = client.search(query, max_results=3)
+        results = client.search(query, max_results=3, timeout=TAVILY_TIMEOUT_S)
         context = "\n\n".join(r["content"] for r in results["results"])
         sources = "\n".join(f"- {r['url']}" for r in results["results"])
 

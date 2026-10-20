@@ -1,5 +1,9 @@
+import functools
+import logging
 import os
 import sqlite3
+import sys
+import time
 import warnings
 from typing import Annotated
 
@@ -24,7 +28,48 @@ from backend.vector_store import search as vs_search
 
 load_dotenv()
 
-llm = ChatGroq(model="openai/gpt-oss-120b")
+# langchain-groq passes timeout=None to the Groq SDK by default, which disables request
+# timeouts entirely: a dead pooled keep-alive connection then hangs a call forever.
+LLM_TIMEOUT_S = float(os.getenv("PAPEER_LLM_TIMEOUT", "60"))
+TAVILY_TIMEOUT_S = float(os.getenv("PAPEER_TAVILY_TIMEOUT", "20"))
+
+llm = ChatGroq(model="openai/gpt-oss-120b", timeout=LLM_TIMEOUT_S, max_retries=2)
+
+
+
+def structured_llm(schema):
+    """Structured output via Groq's strict json_schema mode. The default function-calling
+    mode is flaky on gpt-oss ("Tool choice is required, but model did not call a tool",
+    "attempted to call tool 'json'"); retry the occasional API error as well."""
+    return llm.with_structured_output(schema, method="json_schema", strict=True).with_retry(
+        retry_if_exception_type=(groq.APIError,), stop_after_attempt=3
+    )
+
+
+log = logging.getLogger("pharmalens")
+if not log.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(name)s: %(message)s"))
+    log.addHandler(_handler)
+    log.setLevel(logging.INFO)
+    log.propagate = False
+
+
+def logged_node(fn):
+    """Log start, finish and duration of a graph node (visible in the host's app logs)."""
+    @functools.wraps(fn)
+    def wrapper(state, *args, **kwargs):
+        sid = str(state.get("session_id", ""))[:8]
+        log.info("node %s start session=%s", fn.__name__, sid)
+        started = time.perf_counter()
+        try:
+            result = fn(state, *args, **kwargs)
+        except Exception:
+            log.exception("node %s failed after %.1fs session=%s", fn.__name__, time.perf_counter() - started, sid)
+            raise
+        log.info("node %s done in %.1fs session=%s", fn.__name__, time.perf_counter() - started, sid)
+        return result
+    return wrapper
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -69,9 +114,10 @@ ROUTER_PROMPT = ChatPromptTemplate.from_messages([
     ("human", "{query}"),
 ])
 
-router_chain = ROUTER_PROMPT | llm.with_structured_output(RouterDecision)
+router_chain = ROUTER_PROMPT | structured_llm(RouterDecision)
 
 
+@logged_node
 def router_node(state: RAGState) -> dict:
     query = state["messages"][-1].content
     decision: RouterDecision = router_chain.invoke({"query": query})
@@ -120,7 +166,7 @@ def web_search(
 ) -> list:
     """Search the web for current or supplementary information using Tavily."""
     client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
-    results = client.search(optimized_query, max_results=max_results)
+    results = client.search(optimized_query, max_results=max_results, timeout=TAVILY_TIMEOUT_S)
     if not results.get("results"):
         return [ToolMessage(content="No web results found.", tool_call_id=tool_call_id)]
     web_docs = [
@@ -177,7 +223,7 @@ RELEVANCY_CHECK_SYSTEM = (
     "no useful information.\n\nBe lenient: if there is any substantive overlap, return true."
 )
 
-relevancy_llm = llm.with_structured_output(RelevancyDecision)
+relevancy_llm = structured_llm(RelevancyDecision)
 
 QUERY_REWRITE_SYSTEM = (
     "You are a query rewriting assistant for a research paper retrieval system. "
@@ -190,6 +236,7 @@ QUERY_REWRITE_SYSTEM = (
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
 
+@logged_node
 def agent_node(state: RAGState) -> dict:
     current_attempts = state.get("retrieval_attempts", 0)
     # Once at the cap, skip the LLM entirely so no further tool calls can be emitted.
@@ -205,6 +252,7 @@ def agent_node(state: RAGState) -> dict:
     return updates
 
 
+@logged_node
 def relevancy_check_node(state: RAGState) -> dict:
     query = state["query"]
     docs = state.get("retrieved_docs") or []
@@ -222,6 +270,7 @@ def relevancy_check_node(state: RAGState) -> dict:
     return {"is_relevant": decision.is_relevant}
 
 
+@logged_node
 def query_rewrite_node(state: RAGState) -> dict:
     original_query = state["query"]
     rewrite_count = state.get("rewrite_count", 0)
@@ -253,9 +302,10 @@ CLAIM_ANALYSIS_PROMPT = (
     "- verdict_summary should be 1-2 sentences suitable for display to the user."
 )
 
-verification_llm = llm.with_structured_output(ClaimVerificationResult)
+verification_llm = structured_llm(ClaimVerificationResult)
 
 
+@logged_node
 def verify_claim_node(state: RAGState) -> dict:
     claim = state["messages"][-1].content
     tavily_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
@@ -264,13 +314,17 @@ def verify_claim_node(state: RAGState) -> dict:
     general_results = tavily_client.search(
         f"recent research superseding: {claim[:200]}",
         max_results=5,
+        timeout=TAVILY_TIMEOUT_S,
     ).get("results", [])
+    log.info("verify_claim: general search returned %d result(s)", len(general_results))
 
     # arXiv-targeted search via web to get paper titles and links
     arxiv_results = tavily_client.search(
         f"site:arxiv.org {claim[:200]}",
         max_results=5,
+        timeout=TAVILY_TIMEOUT_S,
     ).get("results", [])
+    log.info("verify_claim: arXiv search returned %d result(s)", len(arxiv_results))
 
     # Build context block
     lines = ["=== General Web Search Results ==="]
@@ -308,6 +362,7 @@ def verify_claim_node(state: RAGState) -> dict:
     }
 
 
+@logged_node
 def generate_answer_node(state: RAGState) -> dict:
     route = state.get("route")
     query = state["query"]
