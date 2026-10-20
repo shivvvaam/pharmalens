@@ -14,6 +14,9 @@ load_dotenv()
 # ── Config ───────────────────────────────────────────────────────────────────
 
 EMBEDDING_DIM = 3072  # gemini-embedding-001 (default output size)
+# Cosine-similarity floor for retrieved chunks; 0 disables filtering (original behaviour).
+# Dropping weak matches is aimed at DeepEval's Contextual Relevancy metric.
+MIN_SCORE = float(os.getenv("PAPEER_MIN_SCORE", "0"))
 
 # ── Singletons ────────────────────────────────────────────────────────────────
 
@@ -85,4 +88,9 @@ def list_papers(session_id: str) -> list[str]:
 
 
 def search(query: str, session_id: str, k: int = 4) -> list[Document]:
-    return get_vectorstore(session_id).similarity_search(query, k=k)
+    if MIN_SCORE <= 0:
+        return get_vectorstore(session_id).similarity_search(query, k=k)
+    scored = get_vectorstore(session_id).similarity_search_with_score(query, k=k)
+    kept = [doc for doc, score in scored if score >= MIN_SCORE]
+    # Always return the best match so the relevancy check, not this filter, decides on a rewrite.
+    return kept or [doc for doc, _ in scored[:1]]
